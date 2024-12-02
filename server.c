@@ -51,6 +51,7 @@ struct client_slot {
   char      src_ip[MAX_IPADDR_LEN];
   uint16_t  src_port;
   uint16_t  my_index;
+  int       client_state;
 };
 
 struct tcp_state {
@@ -118,7 +119,7 @@ static const char *convert_addr_ntop(
 }
 
 static int accept_new_client(int tcp_fd, struct tcp_state *state) {
-  int client_fd;
+  int client_fd, ret = -1;
   struct sockaddr_in addr;
   socklen_t addr_len = sizeof(addr);
   uint16_t src_port;
@@ -165,7 +166,13 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state) {
        */
 
       client->client_fd = client_fd;
-      memcpy(client->src_ip, src_ip_buf, sizeof(src_ip_buf));
+      if (!memcpy(client->src_ip, src_ip_buf, sizeof(src_ip_buf))) {
+        #ifndef NDEBUG
+        printf("memcpy(): " PRERF, PREAR(errno));
+        #endif
+        ret = -1;
+        goto out_close;
+      }
       client->src_port = src_port;
       client->is_used = true;
       client->my_index = i;
@@ -179,7 +186,11 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state) {
       /*
        * Let's tell to `epoll` to monitor this client file descriptor.
        */
-      my_epoll_add(state->epoll_fd, client_fd, EPOLLET | EPOLLIN);
+      if ((ret = my_epoll_add(
+        state->epoll_fd, client_fd, EPOLLET | EPOLLIN
+      )) < 0) {
+        goto out_close;
+      }
       #ifndef NDEBUG
       printf("Client %s:%u has been accepted!\n", src_ip, src_port);
       #endif
@@ -192,7 +203,7 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state) {
 
 out_close:
   close_socket(client_fd);
-  return 0;
+  return ret;
 }
 
 static void handle_client_event(
@@ -466,10 +477,31 @@ static int tcp_state_init_periodic(struct tcp_state *state) {
   its.it_interval = its.it_value;
 
   if (timerfd_settime(state->time_fd, 0, &its, NULL) != 0) {
+    if (close_socket(state->time_fd) != 0) {
+      #ifndef NDEBUG
+      printf("close() " PRERF, PREAR(errno));
+      #endif
+    } else {
+      state->time_fd = -1;
+    }
     return -1;
   }
 
   return 0;
+}
+
+static void tcp_state_destroy(struct tcp_state *state) {
+  if (state->tcp_fd != -1) {
+    close_socket(state->tcp_fd);
+  }
+  if (state->time_fd != -1) {
+    close_socket(state->time_fd);
+  }
+  const size_t client_slot_num = array_size(state->clients);
+  size_t i;
+  for (i = 0; i < client_slot_num; i++) {
+    close_socket(state->clients[i].client_fd);
+  }
 }
 
 int main(void) {
@@ -491,6 +523,8 @@ int main(void) {
   state.stop = false;
 
   ret = event_loop(&state);
+
+  tcp_state_destroy(&state);
 
 out:
   /*
