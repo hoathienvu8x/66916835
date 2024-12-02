@@ -1,5 +1,6 @@
 /*
  * https://stackoverflow.com/questions/66916835/c-confused-by-epoll-and-socket-fd-on-linux-systems-and-async-threads
+ * gcc -Og -g -std=gnu99 -Wall -Wextra -Werror -pedantic 66916835.c -I. -ldl -lpthread -lm -o 66916835
  */
 #include <stdio.h>
 #include <errno.h>
@@ -16,6 +17,7 @@
 #endif
 #define EPOLL_MAP_TO_NOP (0u)
 #define EPOLL_MAP_SHIFT  (1u) /* Shift to cover reserved value MAP_TO_NOP */
+#define array_size(a) (sizeof(a) / sizeof(*a))
 
 struct client_slot {
   bool      is_used;
@@ -68,7 +70,6 @@ static int my_epoll_delete(int epoll_fd, int fd) {
   return 0;
 }
 
-
 static const char *convert_addr_ntop(
   struct sockaddr_in *addr, char *src_ip_buf
 ) {
@@ -83,7 +84,6 @@ static const char *convert_addr_ntop(
   }
   return ret;
 }
-
 
 static int accept_new_client(int tcp_fd, struct tcp_state *state) {
   int client_fd;
@@ -367,10 +367,9 @@ out:
   return ret;
 }
 
-
 static void init_state(struct tcp_state *state) {
-  const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
-  const uint16_t client_map_num = sizeof(state->client_map) / sizeof(*state->client_map);
+  const size_t client_slot_num = array_size(state->clients);
+  const uint16_t client_map_num = array_size(state->client_map);
   size_t i;
   for (i = 0; i < client_slot_num; i++) {
     state->clients[i].is_used = false;
