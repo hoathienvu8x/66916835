@@ -10,20 +10,45 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <sys/timerfd.h>
 #include <netdb.h>
 
 #ifndef NDEBUG
-#define PRERF "(errno=%d) %s\n"
-#define PREAR(NUM) NUM, strerror(NUM)
+  #define PRERF "(errno=%d) %s\n"
+  #define PREAR(NUM) NUM, strerror(NUM)
 #endif
 #define EPOLL_MAP_TO_NOP (0u)
 #define EPOLL_MAP_SHIFT  (1u) /* Shift to cover reserved value MAP_TO_NOP */
 #define array_size(a) (sizeof(a) / sizeof(*a))
 
+#ifndef DEFAULT_TIMEOUT
+  #define DEFAULT_TIMEOUT (3000)
+#endif
+
+#ifndef MAX_EVENTS
+  #define MAX_EVENTS (32)
+#endif
+
+#ifndef BUFFER_SIZE
+  #define BUFFER_SIZE (1024)
+#endif
+
+#ifndef BIND_TO_PORT
+  #define BIND_TO_PORT (1234)
+#endif
+
+#ifndef LISTEN_BACKLOG
+  #define LISTEN_BACKLOG (10)
+#endif
+
+#define MAX_CLIENT_MAP (10000)
+#define MAX_CLIENT_SLOTS (10)
+#define MAX_IPADDR_LEN sizeof("xxx.xxx.xxx.xxx")
+
 struct client_slot {
   bool      is_used;
   int       client_fd;
-  char      src_ip[sizeof("xxx.xxx.xxx.xxx")];
+  char      src_ip[MAX_IPADDR_LEN];
   uint16_t  src_port;
   uint16_t  my_index;
 };
@@ -32,8 +57,9 @@ struct tcp_state {
   bool                stop;
   int                 tcp_fd;
   int                 epoll_fd;
+  int                 time_fd;
   uint16_t            client_c;
-  struct client_slot  clients[10];
+  struct client_slot  clients[MAX_CLIENT_SLOTS];
 
   /*
    * Map the file descriptor to client_slot array index
@@ -41,7 +67,7 @@ struct tcp_state {
    *
    * You must adjust this in production.
    */
-  uint32_t            client_map[10000];
+  uint32_t            client_map[MAX_CLIENT_MAP];
 };
 
 
@@ -81,7 +107,7 @@ static const char *convert_addr_ntop(
 ) {
   const char *ret;
   in_addr_t saddr = addr->sin_addr.s_addr;
-  ret = inet_ntop(AF_INET, &saddr, src_ip_buf, sizeof("xxx.xxx.xxx.xxx"));
+  ret = inet_ntop(AF_INET, &saddr, src_ip_buf, MAX_IPADDR_LEN);
   if (ret == NULL) {
     #ifndef NDEBUG
     printf("inet_ntop(): " PRERF, PREAR((errno ? errno : EINVAL)));
@@ -98,8 +124,8 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state) {
   uint16_t src_port;
   size_t i;
   const char *src_ip;
-  char src_ip_buf[sizeof("xxx.xxx.xxx.xxx")];
-  const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
+  char src_ip_buf[MAX_IPADDR_LEN];
+  const size_t client_slot_num = array_size(state->clients);
 
   memset(&addr, 0, sizeof(addr));
   client_fd = accept(tcp_fd, (struct sockaddr *)&addr, &addr_len);
@@ -173,7 +199,7 @@ static void handle_client_event(
   int client_fd, uint32_t revents, struct tcp_state *state
 ) {
   ssize_t recv_ret;
-  char buffer[1024];
+  char buffer[BUFFER_SIZE];
   const uint32_t err_mask = EPOLLERR | EPOLLHUP;
   /*
    * Read the mapped value to get client index.
@@ -228,11 +254,9 @@ close_conn:
 
 static int event_loop(struct tcp_state *state) {
   int ret = 0, i;
-  int timeout = 3000; /* in milliseconds */
-  int maxevents = 32;
   int epoll_ret;
   int epoll_fd = state->epoll_fd;
-  struct epoll_event events[32];
+  struct epoll_event events[MAX_EVENTS];
   #ifndef NDEBUG
   printf("Entering event loop...\n");
   #endif
@@ -242,14 +266,14 @@ static int event_loop(struct tcp_state *state) {
      * when event comes to my monitored file descriptors, or
      * when the timeout reached.
      */
-    epoll_ret = epoll_wait(epoll_fd, events, maxevents, timeout);
+    epoll_ret = epoll_wait(epoll_fd, events, MAX_EVENTS, DEFAULT_TIMEOUT);
 
     if (epoll_ret == 0) {
         /*
          *`epoll_wait` reached its timeout
          */
         #ifndef NDEBUG
-        printf("I don't see any event within %d milliseconds\n", timeout);
+        printf("I don't see any event within %d milliseconds\n", DEFAULT_TIMEOUT);
         #endif
         continue;
     }
@@ -279,6 +303,15 @@ static int event_loop(struct tcp_state *state) {
         if (accept_new_client(fd, state) < 0) {
           ret = -1;
           goto out;
+        }
+        continue;
+      }
+      // [Epoll Timmer](https://github.com/stsaz/kernel-queue-the-complete-guide/blob/master/epoll-timer.c)
+      if (fd == state->time_fd) {
+        static int n;
+        unsigned long long val;
+        if (read(fd, &val, 8) > 0) {
+          printf("Received timerfd event via epoll: %d\n", n++);
         }
         continue;
       }
@@ -316,7 +349,6 @@ static int init_socket(struct tcp_state *state) {
   struct addrinfo hints, *results, *try;
   char port[20] = {0};
   const char *bind_addr = "0.0.0.0";
-  uint16_t bind_port = 1234;
 
   #ifndef NDEBUG
   printf("Creating TCP socket...\n");
@@ -327,7 +359,7 @@ static int init_socket(struct tcp_state *state) {
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
 
-  if (snprintf(port, sizeof(port) - 1, "%d", bind_port) <= 0) {
+  if (snprintf(port, sizeof(port) - 1, "%d", BIND_TO_PORT) <= 0) {
     #ifndef NDEBUG
     printf("snprintf(): " PRERF, PREAR(errno));
     #endif
@@ -376,7 +408,7 @@ static int init_socket(struct tcp_state *state) {
     goto out;
   }
 
-  ret = listen(tcp_fd, 10);
+  ret = listen(tcp_fd, LISTEN_BACKLOG);
   if (ret < 0) {
     ret = -1;
     #ifndef NDEBUG
@@ -397,7 +429,7 @@ static int init_socket(struct tcp_state *state) {
     goto out;
   }
   #ifndef NDEBUG
-  printf("Listening on %s:%u...\n", bind_addr, bind_port);
+  printf("Listening on %s:%u...\n", bind_addr, BIND_TO_PORT);
   #endif
   state->tcp_fd = tcp_fd;
   return 0;
@@ -419,6 +451,25 @@ static void init_state(struct tcp_state *state) {
   for (i = 0; i < client_map_num; i++) {
     state->client_map[i] = EPOLL_MAP_TO_NOP;
   }
+  state->time_fd = -1;
+}
+
+static int tcp_state_init_periodic(struct tcp_state *state) {
+  int time_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+  if (time_fd < 0) return -1;
+  state->time_fd = time_fd;
+  my_epoll_add(state->epoll_fd, time_fd, EPOLLET | EPOLLIN);
+
+  struct itimerspec its;
+  its.it_value.tv_sec = 1;
+  its.it_value.tv_nsec = 0;
+  its.it_interval = its.it_value;
+
+  if (timerfd_settime(state->time_fd, 0, &its, NULL) != 0) {
+    return -1;
+  }
+
+  return 0;
 }
 
 int main(void) {
@@ -434,6 +485,8 @@ int main(void) {
   ret = init_socket(&state);
   if (ret != 0)
     goto out;
+
+  tcp_state_init_periodic(&state);
 
   state.stop = false;
 
