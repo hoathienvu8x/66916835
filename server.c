@@ -10,6 +10,7 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
 
 #ifndef NDEBUG
 #define PRERF "(errno=%d) %s\n"
@@ -68,6 +69,11 @@ static int my_epoll_delete(int epoll_fd, int fd) {
     return -1;
   }
   return 0;
+}
+
+static int close_socket(int fd) {
+  shutdown(fd, SHUT_RDWR);
+  return close(fd);
 }
 
 static const char *convert_addr_ntop(
@@ -159,7 +165,7 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state) {
   #endif
 
 out_close:
-  close(client_fd);
+  close_socket(client_fd);
   return 0;
 }
 
@@ -215,7 +221,7 @@ close_conn:
   );
   #endif
   my_epoll_delete(state->epoll_fd, client_fd);
-  close(client_fd);
+  close_socket(client_fd);
   client->is_used = false;
   return;
 }
@@ -306,33 +312,67 @@ static int init_epoll(struct tcp_state *state) {
 }
 
 static int init_socket(struct tcp_state *state) {
-  int ret, tcp_fd = -1;
-  struct sockaddr_in addr;
-  socklen_t addr_len = sizeof(addr);
+  int ret, yes = 1, tcp_fd = -1;
+  struct addrinfo hints, *results, *try;
+  char port[20] = {0};
   const char *bind_addr = "0.0.0.0";
   uint16_t bind_port = 1234;
+
   #ifndef NDEBUG
   printf("Creating TCP socket...\n");
   #endif
-  tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
-  if (tcp_fd < 0) {
+
+  memset(&hints, 0, sizeof(struct addrinfo));
+  hints.ai_flags = AI_PASSIVE;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (snprintf(port, sizeof(port) - 1, "%d", bind_port) <= 0) {
     #ifndef NDEBUG
-    printf("socket(): " PRERF, PREAR(errno));
+    printf("snprintf(): " PRERF, PREAR(errno));
     #endif
     return -1;
   }
 
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(bind_port);
-  addr.sin_addr.s_addr = inet_addr(bind_addr);
-
-  ret = bind(tcp_fd, (struct sockaddr *)&addr, addr_len);
-  if (ret < 0) {
-    ret = -1;
+  if (getaddrinfo(bind_addr, port, &hints, &results) != 0) {
     #ifndef NDEBUG
-    printf("bind(): " PRERF, PREAR(errno));
+    printf("getaddrinfo(): " PRERF, PREAR(errno));
     #endif
+    return -1;
+  }
+
+  for (try = results; try != NULL; try = try->ai_next) {
+    // [create the socket in non-blocking mode](https://stackoverflow.com/a/63348937)
+    tcp_fd = socket(
+      try->ai_family, try->ai_socktype | SOCK_NONBLOCK, try->ai_protocol
+    );
+    if (tcp_fd < 0)
+      continue;
+
+    if ((ret = setsockopt(
+      tcp_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes)
+    )) < 0) {
+      #ifndef NDEBUG
+      printf("setsockopt(SO_REUSEADDR): " PRERF, PREAR(errno));
+      #endif
+      freeaddrinfo(results);
+      goto out;
+    }
+
+    if ((ret = bind(tcp_fd, try->ai_addr, try->ai_addrlen)) < 0) {
+      #ifndef NDEBUG
+      printf("bind(): " PRERF, PREAR(errno));
+      #endif
+      freeaddrinfo(results);
+      goto out;
+    }
+    break;
+  }
+
+  freeaddrinfo(results);
+
+  if (try == NULL) {
+    ret = -1;
     goto out;
   }
 
@@ -363,7 +403,7 @@ static int init_socket(struct tcp_state *state) {
   return 0;
 
 out:
-  close(tcp_fd);
+  close_socket(tcp_fd);
   return ret;
 }
 
